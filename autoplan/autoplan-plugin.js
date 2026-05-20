@@ -5,10 +5,12 @@
  *              into worker task prompts to auto-resolve common intermediate questions
  *              (completeness, DRY, explicit over clever, etc.). Also provides a tool for
  *              workers to explicitly invoke autoplan reasoning on a specific decision.
+ *              Inspired by gstack's autoplan decision engine.
  * Version: 1.0.0
  * Author: OpenClaw Observer
  */
 
+// The six core decision principles from gstack's autoplan
 const AUTOPLAN_PRINCIPLES = [
   {
     id: "completeness",
@@ -69,7 +71,10 @@ function resolveDecision(decision = "", context = "") {
   const text = `${decision} ${context}`.toLowerCase();
 
   // Heuristic matching for common decision types
-  if (/should i fix\b|only fix\b|just fix\b/.test(text) && /elsewhere|everywhere|all\b|other/.test(text)) {
+  if (
+    /should i fix\b|only fix\b|just fix\b|fix(?:ing)? (?:it|this|the same|this bug)\b/.test(text) &&
+    /elsewhere|everywhere|\ball\b|other|multiple|several|same pattern|more than one/.test(text)
+  ) {
     return {
       principle: "blast-radius",
       resolution: "Fix the full blast radius — find all similar instances and fix them all.",
@@ -83,14 +88,21 @@ function resolveDecision(decision = "", context = "") {
       confidence: "high"
     };
   }
-  if (/should i create|new.*helper|new.*util|new.*function/.test(text)) {
+  if (/should i create|do i need a|i need a\b|new.*helper|new.*util|new.*function|need.*helper|need.*util/.test(text)) {
     return {
       principle: "dry",
       resolution: "Search the codebase first. If a similar utility already exists, extend or reuse it.",
       confidence: "medium"
     };
   }
-  if (/simple\s+or\s+complex|minimal\s+or\s+full|shortcut\s+or/.test(text)) {
+  if (/simple\s+or\s+complex|minimal\s+or\s+full|class\s+or\s+function|add.*abstraction|need.*abstraction|simpler.*approach|which.*approach.*cleaner|cleaner.*approach/.test(text)) {
+    return {
+      principle: "pragmatic",
+      resolution: "Choose the path with less complexity and fewer moving parts. If the simpler option solves the problem equally well, use it.",
+      confidence: "high"
+    };
+  }
+  if (/shortcut\s+or|complete\s+or\s+partial|full\s+solution\s+or/.test(text)) {
     return {
       principle: "completeness",
       resolution: "Choose the complete solution. Shortcuts create debt.",
@@ -132,7 +144,7 @@ export function createAutoplanPlugin(options = {}) {
     {
       name: "autoplan_resolve",
       description: "Resolve a specific intermediate decision using autoplan principles. Describe the decision you face and get a concrete recommendation based on the six core principles.",
-      scopes: ["worker"],
+      scopes: ["worker", "intake"],
       parameters: {
         decision: "string (required) — the decision you are facing",
         context: "string — additional context about the situation"
@@ -141,13 +153,13 @@ export function createAutoplanPlugin(options = {}) {
     {
       name: "autoplan_principles",
       description: "Get the full text of all six autoplan decision principles. Use when you want to reason through a complex tradeoff with the full principles in front of you.",
-      scopes: ["worker"],
+      scopes: ["worker", "intake"],
       parameters: { abridged: "boolean — return a short summary instead of full principles (default false)" }
     },
     {
       name: "autoplan_checklist",
-      description: "Before starting a task, run through the autoplan preflight checklist: is the scope clear? is this complete or a shortcut? have I searched for existing solutions?",
-      scopes: ["worker"],
+      description: "Run through the autoplan preflight checklist before starting a task: is the scope clear? is this complete or a shortcut? have I searched for existing solutions?",
+      scopes: ["worker", "intake"],
       parameters: {
         taskDescription: "string (required) — what you are about to do"
       }
@@ -196,42 +208,28 @@ export function createAutoplanPlugin(options = {}) {
 
       if (typeof api.addHook !== "function") return;
 
-      // Inject abridged principles into every worker system prompt so workers make
-      // better intermediate decisions without needing to call autoplan_principles explicitly
-      api.addHook("worker:prompt:build", async (payload = {}) => {
+      const injectPrinciples = (payload = {}, extra = []) => {
         const existingLines = Array.isArray(payload?.lines) ? payload.lines : [];
-        return {
-          ...payload,
-          lines: [
-            ...existingLines,
-            buildAutoplanPrinciplesNote(true) // abridged — one line per principle
-          ]
-        };
-      });
+        return { ...payload, lines: [...existingLines, buildAutoplanPrinciplesNote(true), ...extra] };
+      };
+
+      // Inject abridged principles into every worker system prompt. Also remind workers
+      // of the available autoplan tools so they know they can invoke them explicitly.
+      api.addHook("worker:prompt:build", async (payload = {}) =>
+        injectPrinciples(payload, [
+          "When you face an intermediate decision during this task, call autoplan_resolve with the decision text. Use autoplan_principles for a full principles reference, or autoplan_checklist before starting a complex task."
+        ])
+      );
 
       // Inject abridged principles into the intake system prompt so the intake brain
-      // makes better routing/clarify/enqueue decisions using the same principles
-      api.addHook("intake:prompt:build", async (payload = {}) => {
-        const existingLines = Array.isArray(payload?.lines) ? payload.lines : [];
-        return {
-          ...payload,
-          lines: [
-            ...existingLines,
-            buildAutoplanPrinciplesNote(true)
-          ]
-        };
-      });
+      // makes better routing/clarify/enqueue decisions using the same principles.
+      api.addHook("intake:prompt:build", async (payload = {}) => injectPrinciples(payload));
 
-      // Inject a brief principles note into all intake tasks so they are available
-      // to the triage/intake brain without needing an explicit tool call
       api.addHook("intake:tools:list", async (payload = {}) => {
         const tools = Array.isArray(payload?.tools) ? payload.tools.slice() : [];
-        // Add autoplan tools to intake tool list so intake brain can also see them
-        tools.push({
-          name: "autoplan_resolve",
-          description: "Resolve an intermediate decision using autoplan principles. Pass the decision you face as a string.",
-          parameters: { decision: "string (required)", context: "string" }
-        });
+        for (const tool of TOOL_DEFINITIONS) {
+          tools.push({ name: tool.name, description: tool.description, parameters: tool.parameters });
+        }
         return { ...payload, tools };
       });
 
@@ -261,41 +259,78 @@ export function createAutoplanPlugin(options = {}) {
           } else if (name === "autoplan_checklist") {
             const taskDescription = String(args.taskDescription || "").trim();
             if (!taskDescription) throw new Error("taskDescription is required");
-            result = {
-              taskDescription,
-              preflight: [
-                {
-                  check: "Is the task objective clear and verifiable?",
-                  principle: "completeness",
-                  action: taskDescription ? "Yes — proceed" : "Clarify objective before starting"
-                },
-                {
-                  check: "Am I planning a complete solution or a shortcut?",
-                  principle: "completeness",
-                  action: "Choose the complete solution — shortcuts create debt."
-                },
-                {
-                  check: "Have I searched for existing patterns/utilities before creating new ones?",
-                  principle: "dry",
-                  action: "Use list_files or read_file to check for similar code before writing new abstractions."
-                },
-                {
-                  check: "Is my planned approach explicit and readable, or clever and opaque?",
-                  principle: "explicit",
-                  action: "Prefer the explicit approach. Write code that is obviously correct."
-                },
-                {
-                  check: "If I fix a bug here, should I search for the same pattern elsewhere?",
-                  principle: "blast-radius",
-                  action: "Yes — fix the full class of problem, not just the instance you were shown."
-                },
-                {
-                  check: "Am I over-asking for clarification on things I can reasonably infer?",
-                  principle: "bias-to-action",
-                  action: "If intent is clear enough to proceed, proceed. Document assumptions in your final summary."
-                }
-              ]
-            };
+            const td = taskDescription.toLowerCase();
+            const isBugFix = /\b(?:bug|fix|broken|crash|fail(?:ure)?|regression)\b/.test(td);
+            const isNewCode = /\b(?:new|create|implement|build|write|introduce)\b/.test(td);
+            const isRefactor = /\b(?:refactor|restructure|reorganize|rename|extract|clean(?:up)?)\b/.test(td);
+
+            const preflight = [
+              {
+                check: "Is the task objective clear and verifiable?",
+                principle: "completeness",
+                action: "Confirm you can state the done condition in one sentence before proceeding."
+              },
+              {
+                check: "Am I planning a complete solution or a shortcut?",
+                principle: "completeness",
+                action: "Choose the complete solution — shortcuts create debt."
+              }
+            ];
+
+            if (isBugFix) {
+              preflight.push({
+                check: "This looks like a bug fix — have I searched for the same pattern elsewhere?",
+                principle: "blast-radius",
+                action: "Search the codebase for similar instances before closing the task. Fix the whole class of problem.",
+                priority: "high"
+              });
+            }
+
+            if (isNewCode) {
+              preflight.push({
+                check: "This involves creating something new — does a similar utility or pattern already exist?",
+                principle: "dry",
+                action: "Use list_files or read_file to check before writing new abstractions.",
+                priority: "high"
+              });
+            }
+
+            if (isRefactor) {
+              preflight.push({
+                check: "This is a refactor — am I keeping the interface stable or intentionally changing it?",
+                principle: "pragmatic",
+                action: "Choose the simpler resulting structure. Avoid adding complexity in the name of cleanliness."
+              });
+            }
+
+            // Always include these
+            preflight.push(
+              ...(!isNewCode ? [{
+                check: "Have I searched for existing patterns/utilities before creating new ones?",
+                principle: "dry",
+                action: "Use list_files or read_file to check for similar code before writing new abstractions."
+              }] : []),
+              {
+                check: "Is my planned approach explicit and readable, or clever and opaque?",
+                principle: "explicit",
+                action: "Prefer the explicit approach. Write code that is obviously correct."
+              },
+              {
+                check: "Am I over-asking for clarification on things I can reasonably infer?",
+                principle: "bias-to-action",
+                action: "If intent is clear enough to proceed, proceed. Document assumptions in your final summary."
+              }
+            );
+
+            if (!isBugFix) {
+              preflight.push({
+                check: "If I encounter a bug while working, should I search for the same pattern elsewhere?",
+                principle: "blast-radius",
+                action: "Yes — fix the full class of problem, not just the instance you were shown."
+              });
+            }
+
+            result = { taskDescription, preflight };
           }
 
           return { ...payload, handled: true, result };
